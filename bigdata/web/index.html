@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Trạm Điều Phối | Waste Big Data</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/dashboard.js" defer></script>
+</head>
+<body>
+  <aside>
+    <div class="brand"><span class="mark">↗</span><div>TRẠM ĐIỀU PHỐI<small>WASTE / DATA LAB</small></div></div>
+    <nav aria-label="Các trang dashboard">
+      <button data-page="operations" class="selected"><b>01</b> Cảnh báo & thu gom</button>
+      <button data-page="analysis"><b>02</b> Phân tích dòng rác</button>
+      <button data-page="planning"><b>03</b> Điều phối & kế hoạch</button>
+      <button data-page="finance"><b>04</b> Hóa đơn & đối soát</button>
+      <button data-page="health"><b>05</b> Sức khỏe hệ thống</button>
+    </nav>
+    <footer>PHÒNG THÍ NGHIỆM BIG DATA<br>60 khu · 3.600 hộ · 3 loại rác</footer>
+  </aside>
+  <main>
+    <header class="control">
+      <div class="clock"><span id="state" class="tag">ĐANG KẾT NỐI</span><strong id="clock">—</strong></div>
+      <div class="actions">
+        <button data-action="start" class="primary">▶ Bật demo</button>
+        <button data-action="pause">Tạm dừng</button><button data-action="stop">Dừng</button>
+        <select id="scenario" aria-label="Kịch bản demo"><option value="">Kịch bản</option>
+          <option value="peak">Cao điểm 10.000 số đo</option><option value="incident">Hỏng xe & mất tín hiệu</option>
+        </select>
+      </div>
+    </header>
+    <div class="workspace">
+      <div class="heading"><p id="eyebrow"></p><h1 id="title"></h1><p id="subtitle"></p></div>
+      <section class="filters" aria-label="Bộ lọc">
+        <label id="zone-wrap">Khu<select id="zone"><option value="0">Tất cả khu</option></select></label>
+        <label id="category-wrap">Loại rác<select id="category"><option value="">Tất cả loại</option>
+          <option value="organic">Hữu cơ</option><option value="recycle">Tái chế</option><option value="other">Còn lại</option>
+        </select></label>
+        <label id="month-wrap">Tháng<input type="month" id="month" value="2026-10"></label>
+        <label id="house-wrap">Mã hộ<input id="house" placeholder="VD H-0001" maxlength="16"></label>
+        <label id="filter-wrap">Hiển thị<select id="filter"></select></label>
+      </section>
+      <div id="notice" role="status"></div>
+      <div id="content"></div>
+    </div>
+  </main>
+</body>
+</html>
+

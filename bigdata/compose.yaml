@@ -1,0 +1,157 @@
+name: waste-bigdata
+
+x-worker: &worker
+  image: apache/spark:4.0.4-scala2.13-java17-python3-ubuntu
+  entrypoint: ["/opt/spark/bin/spark-class"]
+  command: ["org.apache.spark.deploy.worker.Worker", "--cores", "2", "--memory", "640m", "spark://spark-master:7077"]
+  environment:
+    SPARK_DAEMON_MEMORY: 192m
+    SPARK_LOCAL_DIRS: /tmp/spark
+  depends_on: [spark-master]
+  restart: unless-stopped
+  mem_limit: 1300m
+
+x-hdfs: &hdfs
+  image: apache/hadoop:3.5.0
+  user: root
+  entrypoint: ["/bin/bash", "/cluster/hdfs.sh"]
+  environment:
+    HADOOP_CONF_DIR: /cluster
+    HADOOP_HEAPSIZE_MAX: 256m
+  restart: unless-stopped
+  mem_limit: 480m
+
+services:
+  postgres:
+    image: postgres:16.11-bookworm
+    environment:
+      POSTGRES_DB: waste
+      POSTGRES_USER: waste
+      POSTGRES_PASSWORD: waste_demo
+    volumes:
+      - pg:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U waste -d waste && psql -U waste -d waste -Atqc 'select 1 from demo limit 1'"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 420m
+
+  kafka:
+    image: apache/kafka:4.1.2
+    user: root
+    restart: unless-stopped
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 4
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx384m"
+    volumes: [kafka:/tmp/kraft-combined-logs]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null"]
+      interval: 12s
+      timeout: 10s
+      retries: 15
+    mem_limit: 850m
+
+  namenode:
+    <<: *hdfs
+    hostname: namenode
+    command: ["namenode"]
+    volumes:
+      - ./cluster:/cluster:ro
+      - nn:/data
+    ports: ["127.0.0.1:9870:9870"]
+
+  datanode-1:
+    <<: *hdfs
+    hostname: datanode-1
+    command: ["datanode"]
+    volumes:
+      - ./cluster:/cluster:ro
+      - dn1:/data
+    depends_on: [namenode]
+
+  datanode-2:
+    <<: *hdfs
+    hostname: datanode-2
+    command: ["datanode"]
+    volumes:
+      - ./cluster:/cluster:ro
+      - dn2:/data
+    depends_on: [namenode]
+
+  spark-master:
+    image: apache/spark:4.0.4-scala2.13-java17-python3-ubuntu
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master"]
+    environment: {SPARK_DAEMON_MEMORY: 192m}
+    ports: ["127.0.0.1:8089:8080"]
+    mem_limit: 370m
+
+  spark-worker-1:
+    <<: *worker
+
+  spark-worker-2:
+    <<: *worker
+
+  stream:
+    build:
+      context: .
+      dockerfile: cluster/Spark.Dockerfile
+    entrypoint: ["/bin/bash", "/cluster/stream.sh"]
+    environment:
+      HADOOP_CONF_DIR: /cluster
+      SPARK_LOCAL_IP: stream
+      DB_DSN: postgresql://waste:waste_demo@postgres/waste
+    volumes:
+      - ./cluster:/cluster:ro
+      - ./src:/code:ro
+    ports: ["127.0.0.1:4040:4040"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      datanode-1: {condition: service_started}
+      datanode-2: {condition: service_started}
+      spark-worker-1: {condition: service_started}
+      spark-worker-2: {condition: service_started}
+    restart: unless-stopped
+    mem_limit: 1450m
+
+  app:
+    build:
+      context: .
+      dockerfile: cluster/App.Dockerfile
+    environment:
+      DB_DSN: postgresql://waste:waste_demo@postgres/waste
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./src:/code:ro
+      - ./web:/web:ro
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+    restart: unless-stopped
+    mem_limit: 400m
+
+volumes:
+  pg:
+  kafka:
+  nn:
+  dn1:
+  dn2:
+
