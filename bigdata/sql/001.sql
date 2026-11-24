@@ -41,13 +41,12 @@ CREATE TABLE task (
 CREATE UNIQUE INDEX one_active_stop ON task(bin) WHERE status IN ('assigned','collecting');
 CREATE INDEX task_truck_idx ON task(truck,status,rank);
 CREATE INDEX task_bin_history ON task(bin,id DESC);
+CREATE INDEX task_completed_bin_idx ON task(bin) WHERE status IN ('completed','partial');
 
-CREATE TABLE outbox (
-    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    body jsonb NOT NULL, due timestamptz NOT NULL,
-    topic text, part integer, kafka_offset bigint
+CREATE TABLE kafka_produced (
+    topic text NOT NULL, part integer NOT NULL, kafka_offset bigint NOT NULL,
+    PRIMARY KEY(topic,part)
 );
-CREATE INDEX outbox_pending ON outbox(due,id) WHERE kafka_offset IS NULL;
 CREATE TABLE kafka_cursor (
     topic text NOT NULL, part integer NOT NULL, kafka_offset bigint NOT NULL,
     PRIMARY KEY(topic,part)
@@ -58,6 +57,7 @@ CREATE TABLE event (
 );
 CREATE INDEX event_recent ON event(received DESC);
 CREATE INDEX event_kind_recent ON event(kind,received DESC);
+CREATE INDEX event_pickup_occurred_idx ON event(occurred) WHERE kind='pickup';
 CREATE TABLE bin_state (
     bin text PRIMARY KEY REFERENCES bin, occurred timestamptz NOT NULL,
     grams integer NOT NULL, fill_pct numeric NOT NULL, event_id text NOT NULL
@@ -68,6 +68,7 @@ CREATE TABLE daily (
     PRIMARY KEY(day,bin)
 );
 CREATE INDEX daily_bin_day ON daily(bin,day);
+CREATE INDEX daily_day_idx ON daily(day);
 CREATE TABLE microbatch (
     id bigint PRIMARY KEY, processed timestamptz NOT NULL DEFAULT now(),
     input integer NOT NULL, clean integer NOT NULL, quarantine integer NOT NULL,
@@ -110,15 +111,15 @@ CREATE TABLE payment_attempt (
 );
 CREATE UNIQUE INDEX payment_one_match ON payment_attempt(invoice_ref) WHERE status='matched';
 CREATE INDEX payment_invoice_idx ON payment_attempt(invoice_ref,status);
+CREATE INDEX payment_review_idx ON payment_attempt(invoice_ref,house) WHERE status='review';
 CREATE INDEX payment_recent ON payment_attempt(paid_at DESC);
 
 CREATE VIEW invoice_status AS
 SELECT i.*, h.zone, paid.paid_at, CASE
   WHEN paid.paid_at IS NOT NULL THEN 'paid'
+  WHEN (d.clock AT TIME ZONE 'Asia/Ho_Chi_Minh')::date >= i.suspend_from THEN 'overdue'
   WHEN EXISTS(SELECT 1 FROM payment_attempt a WHERE a.invoice_ref=i.id AND a.house=i.house
-              AND a.status='review' AND a.reason='amount_mismatch') THEN 'review'
-  WHEN (d.clock AT TIME ZONE 'Asia/Ho_Chi_Minh')::date >= i.suspend_from
-       AND EXISTS(SELECT 1 FROM closed_month m WHERE m.month=i.suspend_from-interval '1 month') THEN 'overdue'
+              AND a.status='review' AND a.reason IN ('underpaid','amount_mismatch')) THEN 'review'
   ELSE 'unpaid' END AS status
 FROM invoice i JOIN household h ON h.id=i.house CROSS JOIN demo d
 LEFT JOIN payment_attempt paid ON paid.invoice_ref=i.id AND paid.status='matched';

@@ -6,6 +6,8 @@ exec /opt/spark/bin/spark-submit \
   --conf spark.driver.host=stream \
   --conf spark.driver.bindAddress=0.0.0.0 \
   --conf spark.executor.cores=2 --conf spark.cores.max=4 \
+  --conf spark.network.timeout=86400s \
+  --conf spark.executor.heartbeatInterval=30s \
   --conf spark.scheduler.minRegisteredResourcesRatio=1 \
   --conf spark.scheduler.maxRegisteredResourcesWaitingTime=35s \
   --conf spark.sql.shuffle.partitions=4 \

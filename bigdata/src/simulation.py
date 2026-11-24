@@ -1,20 +1,38 @@
 """Transactional world state and a durable outbox. All weights are integer grams."""
 import math
 import random
-from collections import defaultdict, deque
+from collections import defaultdict
 from datetime import timedelta
-from itertools import groupby
 
 from psycopg.types.json import Jsonb
 
-from db import VN, log
+from db import VN, WATCH_BINS, WATCH_IOT, log
 from finance import close_period, simulated_payments
+
+WATCH_SET = set(WATCH_BINS)
 
 CATEGORIES = {"organic": (330, 220, 20), "recycle": (95, 65, 30), "other": (145, 135, 20)}
 CODES = {"organic": "O", "recycle": "R", "other": "C"}
 FRAME = timedelta(hours=12)
 MAX_BLACKOUTS = 19
 TRIPS_PER_FRAME = {"organic": 4, "recycle": 2, "other": 2}
+
+
+def shift_start(start, zone, category, step):
+    cat_idx = 0 if category == "organic" else 1 if category == "other" else 2
+    slot = (zone * 31 + step * 17 + cat_idx * 13) % 100
+    if slot < 20:
+        # 20% gom rải rác ở các khung giờ thấp điểm (đêm khuya, trưa chiều, tối muộn)
+        off_hours = (0.55, 1.25, 2.2, 3.2, 4.15, 8.2, 9.2, 10.1, 10.8) if start.hour == 0 else (
+            0.55, 1.25, 2.2, 3.2, 4.15, 9.15, 10.1, 10.75)
+        minutes = round(off_hours[(zone + step + cat_idx) % len(off_hours)] * 60)
+        return start + timedelta(minutes=minutes)
+    cat_shift = cat_idx * 18
+    if start.hour == 0:
+        peak_min = (zone * 13 + cat_shift) % 85
+    else:
+        peak_min = (zone * 17 + cat_shift * 2) % 175
+    return start + timedelta(hours=5, minutes=peak_min)
 
 
 def seed_catalog(conn, seed):
@@ -37,16 +55,14 @@ def seed_catalog(conn, seed):
 
 def backlog(conn):
     return conn.execute("""
-        SELECT EXISTS(SELECT 1 FROM outbox WHERE kafka_offset IS NULL)
-            OR EXISTS(SELECT 1 FROM (
-                 SELECT topic,part,max(kafka_offset) AS last FROM outbox
-                 WHERE kafka_offset IS NOT NULL GROUP BY topic,part
-               ) o LEFT JOIN kafka_cursor c USING(topic,part)
-               WHERE c.kafka_offset IS NULL OR c.kafka_offset < o.last) AS waiting
+        SELECT EXISTS(
+            SELECT 1 FROM kafka_produced p LEFT JOIN kafka_cursor c USING(topic,part)
+            WHERE p.kafka_offset > coalesce(c.kafka_offset,-1)
+        ) AS waiting
     """).fetchone()["waiting"]
 
 
-def frame(conn, state):
+def frame(conn, state, publish):
     start = state["clock"].astimezone(VN)
     end = start + FRAME
     day = start.date()
@@ -64,18 +80,11 @@ def frame(conn, state):
     last = end - timedelta(seconds=1)
 
     def emit(kind, subject, occurred, amount=None, unit=None, capacity=None, data=None, delay=False):
-        due = end
-        emitted = occurred
-        if delay:
-            emitted = occurred + timedelta(hours=5)
-            if end.day != start.day and end.day == 1:
-                emitted = min(emitted, last)
-            else:
-                due = end + FRAME
+        emitted = occurred + timedelta(hours=5) if delay else occurred
         event = {"id": f"E-{step:06d}-{len(output):06d}", "kind": kind, "subject": subject,
                  "at": occurred.isoformat(), "emitted": emitted.isoformat(), "amount": amount, "unit": unit,
                  "capacity_g": capacity, "data": data}
-        output.append((event, due))
+        output.append(event)
         return event
 
     bins = conn.execute("""
@@ -90,27 +99,43 @@ def frame(conn, state):
     blocked = {row["house"] for row in conn.execute("SELECT DISTINCT house FROM invoice_status WHERE status='overdue'")}
     before = {b["id"]: (b["grams"],b["last_pickup"],b["blackout_until"]) for b in bins}
     active_blackouts = sum(bool(b["blackout_until"] and b["blackout_until"] > start) for b in bins)
-    fair = state["scenario"] == "peak" or (day.day == 7 and day.month == 11)
+    auto_incident = (step % 2 == 1)
+    iot_target = WATCH_IOT[(step // 2) % len(WATCH_IOT)]
+    auto_peak = (step % 6 == 0)
+    fair = auto_peak or (day.day == 7 and day.month == 11)
     if step == 0:
-        log(conn, "simulator", "info", "Bắt đầu lịch sử mô phỏng từ 30/10. Kỳ đầu gồm hai ngày.")
+        log(conn, "simulator", "info", "Bắt đầu kịch bản demo tổng hợp từ 30/10.")
     for b in bins:
         capacity = b["capacity_l"]*b["density_g_l"]
         category = b["category"]
+        is_watch = b["id"] in WATCH_SET
+        queued = False
         if b["house"] not in blocked and b["id"] not in active and b["measured"] and b["grams"]:
             age = (start-b["last_pickup"]).total_seconds()/3600
             fill = b["measured"]*100/capacity
             if b["measured_at"] >= b["last_pickup"] and (fill >= 75 or age >= b["interval_h"]):
-                b["priority"] = min(fill, 160)*.14 + min(age/b["interval_h"],3)*5
-                b["priority"] += min(b["measured"]/1000,10)
+                b["priority"] = min(fill, 160)*.14 + min(age/b["interval_h"],3)*5 + min(b["measured"]/1000,10)
+                if is_watch:
+                    b["priority"] += 12
                 candidate[b["zone"],category].append(b)
+                queued = True
         chance = {"organic": .58,"recycle": .32,"other": .42}[category]
         chance *= (1.12 if start.hour else .8) * (1.1 if start.weekday() >= 5 else 1)
-        boost = 2.4 if fair and b["zone"] <= 6 else 1
-        # Leave the last three hours of the frame for collection and unloading.
-        at = start + timedelta(seconds=rng.randint(60, 30_000))
-        if rng.random() < min(.92,chance*boost):
-            mass = max(5, round(rng.gammavariate(3,1/3)*CATEGORIES[category][0]*b["people"]
-                                *float(b["profile"])*boost*(.83 + b["zone"]%7*.05)))
+        boost = 2.0 if fair and b["zone"] <= 6 else 1
+        if is_watch:
+            boost *= 2.2 if category == "organic" else 2.8
+        # Leave morning/evening peak collection windows after household deposits.
+        truck_at = shift_start(start, b["zone"], category, step)
+        max_dep = max(600, min(17_400, int((truck_at - start).total_seconds()) - 300))
+        at = start + timedelta(seconds=rng.randint(60, max_dep))
+        max_grams = round(capacity * 1.2)
+        deposit_prob = 0.96 if is_watch else min(.92, chance * boost)
+        if b["grams"] < max_grams and rng.random() < deposit_prob:
+            raw_mass = max(5, round(rng.gammavariate(3,1/3)*CATEGORIES[category][0]*b["people"]
+                                    *float(b["profile"])*boost*(.83 + b["zone"]%7*.05)))
+            if is_watch:
+                raw_mass = max(raw_mass, round(capacity * rng.uniform(0.22, 0.42)))
+            mass = min(raw_mass, max_grams - b["grams"])
             b["grams"] += mass
             emit("deposit", b["id"], at, mass, "g")
         if b["blackout_until"] and b["blackout_until"] > start:
@@ -118,89 +143,74 @@ def frame(conn, state):
         if b["blackout_until"]:
             emit("signal",b["id"],at,data={"state":"restored"})
             b["blackout_until"] = None
-        forced_blackout = state["scenario"] == "incident" and b["id"] == "H-0001-O"
-        random_blackout = rng.random() < .00008
-        # Reserve the last slot for the manual incident scenario.
-        if ((forced_blackout and active_blackouts < MAX_BLACKOUTS) or
-                (random_blackout and active_blackouts < MAX_BLACKOUTS - 1)):
-            b["blackout_until"] = end + timedelta(hours=24)
+        watch_blackout = auto_incident and b["id"] == iot_target
+        forced_blackout = auto_incident and (b["id"] not in WATCH_SET and b["id"].endswith("1-O") and b["zone"] <= 8)
+        random_blackout = b["id"] not in WATCH_SET and rng.random() < .00008
+        if watch_blackout or ((forced_blackout and active_blackouts < MAX_BLACKOUTS - 1) or
+                              (random_blackout and active_blackouts < MAX_BLACKOUTS - 2)):
+            b["blackout_until"] = end if b["id"] in WATCH_SET else end + timedelta(hours=24)
             active_blackouts += 1
             emit("signal",b["id"],at,data={"state":"lost"})
             continue
-        if rng.random() < .26 or (b["grams"] >= capacity*.75 and rng.random() < .45):
-            sample_at = min(last, at + timedelta(seconds=rng.randint(20,1800)))
+        if is_watch or rng.random() < .26 or (b["grams"] >= capacity*.75 and rng.random() < .45):
+            sensor_cap = min(last, truck_at - timedelta(seconds=30))
+            sample_at = min(sensor_cap, at + timedelta(seconds=rng.randint(20,1800)))
             kg = rng.random() < .3
             sample = emit("sensor", b["id"], sample_at, b["grams"]/1000 if kg else b["grams"],
-                          "kg" if kg else "g", capacity, delay=rng.random() < .008)
-            anomaly = rng.random()
+                          "kg" if kg else "g", capacity, delay=not is_watch and rng.random() < .008)
+            anomaly = 1.0 if is_watch else rng.random()
             if anomaly < .003:
                 sample["amount"] = None
             elif anomaly < .006:
                 sample["unit"] = "lb"
             elif anomaly < .014:
-                output.append((sample.copy(), end))
+                output.append(sample.copy())
+            if is_watch and not queued and b["house"] not in blocked and b["id"] not in active and b["grams"]:
+                fill_now = b["grams"]*100/capacity
+                age_now = (truck_at - b["last_pickup"]).total_seconds()/3600
+                if fill_now >= 75 or age_now >= b["interval_h"]:
+                    b["priority"] = min(fill_now, 160)*.14 + min(age_now/b["interval_h"],3)*5 + min(b["grams"]/1000,10) + 12
+                    candidate[b["zone"],category].append(b)
+                    queued = True
 
-    route(conn, start, end, state["scenario"], by_id, candidate, blocked, emit)
-    if state["scenario"] == "peak":
-        # 10,000 distinct measurements in one virtual minute. No new mass is implied.
+    route(conn, start, end, "incident" if auto_incident else "normal", by_id, candidate, blocked, emit, step)
+    if auto_peak:
         available = [b for b in bins if not b["blackout_until"]]
-        for n,b in enumerate(available[:10000]):
+        for n,b in enumerate(available[:3600]):
             emit("sensor", b["id"], last-timedelta(seconds=n % 60), b["grams"], "g",
                  b["capacity_l"]*b["density_g_l"], data={"state":"peak"})
-        log(conn,"simulator","info","Cao điểm: thêm đúng 10.000 số đo trong 60 giây mô phỏng")
+        log(conn,"simulator","info","Cao điểm tự động: bổ sung 3.600 số đo cảm biến đồng loạt")
 
-    simulated_payments(conn,start,end,emit)
+    simulated_payments(conn,start,end,emit,step)
+    ordered_events = sorted(output, key=lambda e: (e["at"], e["id"]))
+    offsets = publish(ordered_events)
     with conn.cursor() as cur:
         cur.executemany("UPDATE physical_bin SET grams=%s,last_pickup=%s,blackout_until=%s WHERE bin=%s",
                         [(*after,b["id"]) for b in bins
                          if (after := (b["grams"],b["last_pickup"],b["blackout_until"])) != before[b["id"]]])
-        with cur.copy("COPY outbox(body,due) FROM STDIN") as copy:
-            for body,due in order_outbox(output, start+timedelta(hours=9)):
-                # Do not carry prior-month late measurements across a close barrier.
-                if end.day == 1 and start.day != 1:
-                    due = min(due,end)
-                copy.write_row((Jsonb(body),due))
+        if offsets:
+            cur.executemany("""
+                INSERT INTO kafka_produced VALUES(%s,%s,%s)
+                ON CONFLICT(topic,part) DO UPDATE SET kafka_offset=greatest(excluded.kafka_offset,kafka_produced.kafka_offset)
+            """, [(topic, part, offset) for (topic, part), offset in offsets.items()])
     conn.execute("UPDATE demo SET clock=%s,step=step+1,waiting=NULL,scenario='normal' WHERE id", (end,))
-
-
-def order_outbox(output, before_collection):
-    ordered = sorted(output, key=lambda pair:(pair[1],pair[0]["at"],pair[0]["id"]))
-    cutoff = before_collection.isoformat()
-    for _, group in groupby(ordered, key=lambda pair:pair[1]):
-        rows = list(group)
-        slots = []
-        levels = [deque() for _ in range(4)]
-        for index,(body,_) in enumerate(rows):
-            if (body["kind"] != "sensor" or body["at"] >= cutoff
-                    or body["unit"] not in ("g","kg") or body["amount"] is None):
-                continue
-            grams = body["amount"]*(1000 if body["unit"]=="kg" else 1)
-            pct = round(grams*100/body["capacity_g"],1)
-            level = 3 if pct>100 else 2 if pct>=95 else 1 if pct>=75 else 0
-            slots.append(index)
-            levels[level].append(rows[index])
-        indices = iter(slots)
-        levels = [level for level in levels if level]
-        while levels:
-            for level in levels:
-                rows[next(indices)] = level.popleft()
-            levels = [level for level in levels if level]
-        yield from rows
 
 
 def distance(x,y,a,b):
     return math.hypot(float(x-a),float(y-b))
 
 
-def route(conn,start,end,scenario,bins,candidates,blocked,emit):
+def route(conn,start,end,scenario,bins,candidates,blocked,emit,step=0):
     tasks = defaultdict(list)
     for task in conn.execute("SELECT * FROM task WHERE status='assigned' ORDER BY rank"):
         tasks[task["truck"]].append(task)
-    trucks = conn.execute("SELECT * FROM truck ORDER BY id").fetchall()
+    trucks = conn.execute("SELECT * FROM truck WHERE status<>'standby' ORDER BY id").fetchall()
     forced = scenario == "incident"
+    target_zone = (step // 2) % 10 + 1
+    target_cat = "other" if target_zone in (3, 6, 9) else "organic"
     for t in trucks:
         vehicle = t["id"]
-        at = start + timedelta(hours=9,minutes=10+t["zone"]%5)
+        at = shift_start(start, t["zone"], t["category"], step)
         queue = tasks[vehicle]
         changed = t["status"] == "broken"
         if changed:
@@ -214,7 +224,8 @@ def route(conn,start,end,scenario,bins,candidates,blocked,emit):
             if not queue and not options and not t["load_g"]:
                 break
             assign_stops(conn,t,queue,options,bins,at,emit)
-            at = collect_trip(conn,t,queue,bins,blocked,at,end,forced,emit)
+            hit_incident = forced and ((t["zone"], t["category"]) == (target_zone, target_cat) or t["zone"] > target_zone)
+            at = collect_trip(conn,t,queue,bins,blocked,at,end,hit_incident,emit)
             changed = True
             if t["status"] == "broken":
                 forced = False
@@ -252,7 +263,7 @@ def collect_trip(conn,t,queue,bins,blocked,at,end,forced,emit):
             queue.pop(0)
             continue
         if forced and picked_up:
-            t.update(status="broken",recover_at=end+FRAME,broken_h=t["broken_h"]+12)
+            t.update(status="broken",recover_at=end,broken_h=t["broken_h"]+12)
             emit("vehicle",vehicle,at,data={"state":"broken","reason":"simulated_fault","bin":b["id"]})
             log(conn,"routing","warning",f"{vehicle} hỏng; hàng trên xe được giữ lại, điểm chưa gom được mở lại")
             conn.execute("UPDATE task SET status='requeued',finished_at=%s WHERE truck=%s AND status='assigned'",

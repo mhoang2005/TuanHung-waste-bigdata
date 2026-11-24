@@ -7,6 +7,7 @@ x-worker: &worker
   environment:
     SPARK_DAEMON_MEMORY: 192m
     SPARK_LOCAL_DIRS: /tmp/spark
+    SPARK_WORKER_OPTS: "-Dspark.worker.timeout=86400"
   depends_on: [spark-master]
   restart: unless-stopped
   mem_limit: 1300m
@@ -98,7 +99,9 @@ services:
     image: apache/spark:4.0.4-scala2.13-java17-python3-ubuntu
     entrypoint: ["/opt/spark/bin/spark-class"]
     command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master"]
-    environment: {SPARK_DAEMON_MEMORY: 192m}
+    environment:
+      SPARK_DAEMON_MEMORY: 192m
+      SPARK_MASTER_OPTS: "-Dspark.worker.timeout=86400"
     ports: ["127.0.0.1:8089:8080"]
     mem_limit: 370m
 

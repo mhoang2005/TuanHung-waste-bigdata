@@ -1,47 +1,41 @@
-# Waste Big Data — bàn giao phát triển
+# Trạm Điều Phối Rác Tuấn Hùng — Hệ thống Quản lý Thu gom & Tính phí Rác Hộ Gia Đình
 
-Dự án bài tập lớn quản lý thu gom và thu phí rác theo hộ gia đình. **Mã nguồn hiện hành nằm trong `bigdata/`.** Đọc `AGENTS.md` trước khi giao việc cho AI.
+Dự án xây dựng **Trạm Điều Phối Rác Tuấn Hùng** — hệ thống khép kín quản lý thu gom, quy hoạch thùng/đội xe tự động và tính phí rác theo hộ gia đình trên nền tảng **Apache Kafka, Spark Structured Streaming, Hadoop HDFS, PostgreSQL và FastAPI**.
 
-## Chạy trên máy khác
+## 1. Khởi chạy nhanh trên Windows
 
-Cài Git và Docker Desktop (Linux containers; Windows dùng WSL2). Clone repository này, sau đó:
+Chỉ cần nháy đúp vào file **`run-system.bat`** ở thư mục gốc, hoặc chạy bằng PowerShell:
 
-```sh
+```powershell
 cd bigdata
 docker compose up -d --build
 ```
 
-Mở http://localhost:8000 và bấm **Bật demo**. Một nút dùng chung năm dashboard, không chọn nguồn dữ liệu, không có bản đồ. Lần đầu Spark cần thời gian khởi tạo. Tạm dừng/tiếp tục giữ đồng hồ; dữ liệu đã vào hàng đợi tiếp tục xử lý.
+Sau đó mở trình duyệt tại **http://localhost:8000** và bấm **▶ Bật demo**.
 
-```sh
-docker compose ps
-docker compose logs -f app stream
-docker compose down
-```
+## 2. Vòng tròn Nghiệp vụ Khép kín (4 Bước + Nền tảng Big Data)
 
-`down` giữ volume; không dùng `down -v` nếu cần giữ phiên demo. Git chỉ chuyển mã và tài liệu, không chuyển PostgreSQL, Kafka, HDFS hay checkpoint đang nằm trong Docker volume. Máy mới tạo dữ liệu mới. Không chạy đồng thời nhiều bản Compose của dự án trên cùng các cổng.
+1. **Bước 1 — Cảm biến & Điều xe thu gom**:
+   - Quản lý **60 khu × 60 hộ = 3.600 hộ gia đình**, **10.800 thùng rác** (3 loại: Hữu cơ `O`, Tái chế `R`, Còn lại `C`) và **180–360 xe thu gom nhỏ**.
+   - Cảm biến tại từng thùng gửi khối lượng rác (`g` hoặc `kg`), quy đổi ra **% thể tích đầy** (`Gần đầy 75–94%`, `Đã đầy 95–100%`, `Quá tải >100%`) và cảnh báo `Để quá lâu`.
+   - Hệ thống chấm điểm ưu tiên và phân xe cùng khu, cùng loại đi gom theo lộ trình ngắn nhất; xử lý sự cố xe hỏng và mất tín hiệu IoT.
+2. **Bước 2 — Thống kê & Trực quan hóa khối lượng**:
+   - Spark Structured Streaming tổng hợp khối lượng rác phát sinh và khối lượng thực tế đã thu gom theo ngày, khu, hộ và loại rác.
+3. **Bước 3 — Tự động điều chỉnh Thùng rác, Lịch gom & Đội xe**:
+   - Cuối mỗi kỳ tháng, tự động **tăng/giảm dung tích thùng (±5 L, giới hạn 10–100 L)** và **rút ngắn/kéo dài lịch gom (±24 giờ, giới hạn 24–120 giờ)** cho từng hộ gia đình.
+   - Tự động **tăng/giảm số lượng xe theo khu (1 ↔ 2 xe mỗi loại rác)** dựa trên mật độ lượt thu gom trong kỳ.
+4. **Bước 4 — Hóa đơn, Đối soát Thanh toán & Kiểm soát nợ**:
+   - Tự động chốt sổ và phát hành **3.600 hóa đơn/tháng** (`15.000 đ phí cơ bản + Kg Hữu cơ × 750 đ + Kg Tái chế × 250 đ + Kg Còn lại × 1.100 đ`). Hỗ trợ xem và in PDF từng hóa đơn.
+   - Hộ gia đình chuyển khoản kèm nội dung là **Mã hóa đơn**.
+   - **Không thanh toán** hoặc **thanh toán thiếu tiền**: Sau 1 tháng kể từ ngày phát hành hóa đơn sẽ chuyển sang trạng thái **Quá hạn · Ngừng gom** $\rightarrow$ Quay lại Bước 1 xe rác sẽ **bỏ qua không thu gom**.
+   - **Thanh toán thừa tiền / gửi sai mã**: Hóa đơn thừa tiền vẫn được tính hoàn tất thu gom; hộ dân liên hệ Phòng Đối Soát Tuấn Hùng bên ngoài hệ thống (`Hotline: 1900 6886` / `doisoat@tuanhung.vn`) để hoàn tiền thừa.
 
-## Bài toán
+## 3. Kiến trúc Big Data
 
-60 khu × 60 hộ = 3.600 hộ; 10.800 thùng theo ba loại hữu cơ/tái chế/còn lại; 180 xe nhỏ. Theo dõi tồn thùng, mức đầy và tuổi chờ; phân xe phù hợp loại và khu, xử lý xe hỏng; thống kê khối lượng từng hộ/khu; điều chỉnh sức chứa và khoảng thu gom; chốt hóa đơn từng hộ và đối soát thanh toán. Quá hạn hết tháng kế tiếp mới ngừng phục vụ. Không AI/ML.
+`Bộ sinh dữ liệu (IoT, Xe, Ngân hàng) → Apache Kafka (2 Topic × 4 Partition) → Spark Structured Streaming (1 Master + 2 Workers / Executors) → Hadoop HDFS (2 DataNodes, Replication = 2, Parquet 4 lớp: raw / clean / quarantine / analysis) + PostgreSQL → FastAPI & Web Dashboard`
 
-Python sinh sự kiện → outbox PostgreSQL → HTTP API → Kafka (2 topic, 4 partition/topic) → Spark Structured Streaming (2 worker/executor) → HDFS (2 DataNode, replication 2) + PostgreSQL → FastAPI và dashboard HTML/CSS/JavaScript. Một broker Kafka; không YARN; không tuyên bố HA khi hỏng host.
-
-## Đọc tiếp
-
-- [Hướng dẫn chạy và demo hiện hành](bigdata/README.md)
-- [Kiến trúc, công thức, chính sách và nghiệm thu](bigdata/docs/BAO_CAO.md)
-- [Kết quả được ghi nhận ngày 10/11/2026](bigdata/docs/KET_QUA.md): dữ liệu lịch sử, chưa tái chạy trong lần bàn giao 22/11/2026.
-- [Ngữ cảnh và công việc cho AI](AGENTS.md)
-- [Yêu cầu trước lần xây dựng lại](YEU_CAU_DU_AN_MOI.md): tham khảo ý định người dùng; một số công thức/tham số khác triển khai mới, xem AGENTS.md.
-
-## Phân biệt các thư mục
-
-| Thư mục | Vai trò |
-| --- | --- |
-| `bigdata/` | Dự án Docker/FastAPI hiện hành, ưu tiên phát triển tại đây |
-| `project/` | Bản nháp cũ VM/YARN/Grafana, giữ để tham khảo, không chạy theo hướng dẫn này |
-| `outputs/` | Đề cương cũ, cần cập nhật trước khi nộp theo phiên bản hiện hành |
-| `work/` | Script và tài liệu làm việc lịch sử, có đường dẫn máy cũ; không phải lệnh cài dự án |
-
-Không đưa khóa SSH, file `.env`, bộ cài, môi trường Python, ảnh máy ảo và dữ liệu sinh lớn vào Git. Mật khẩu `waste_demo` trong Compose là giá trị cố định dành cho lab cục bộ, không phải bí mật tài khoản thực; không dùng cấu hình này triển khai Internet.
+- **Dashboard chính**: http://localhost:8000
+- **Spark Master UI**: http://localhost:8089
+- **Spark Driver UI**: http://localhost:4040
+- **HDFS NameNode UI**: http://localhost:9870
+- **Tài liệu toàn bộ dự án (Nghiệp vụ, Kiến trúc, Demo 5 phút)**: [TAI_LIEU_TOAN_BO_DU_AN.md](TAI_LIEU_TOAN_BO_DU_AN.md)

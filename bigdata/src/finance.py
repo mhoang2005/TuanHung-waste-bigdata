@@ -22,21 +22,23 @@ def close_period(conn, day):
           FROM totals t JOIN tariff p USING(category)
         )
         INSERT INTO invoice
-        SELECT 'HD-' || to_char(%s::date,'YYYYMM') || '-' || house,house,%s,%s,%s,
+        SELECT 'HD-' || to_char(%s::date,'YYYYMM') || '-' || house,house,%s,%s,
+               CASE WHEN substring(house from '[0-9]+$')::int %% 100 IN (0, 19, 20, 40)
+                         AND house NOT IN ('H-0120', 'H-0340') THEN %s::date
+                    ELSE %s END,
                (SELECT base_vnd FROM fee_config),
                jsonb_agg(jsonb_build_object('category',category,'grams',grams,'pickups',pickups,
                           'rate',vnd_kg,'cost',cost) ORDER BY category),
                (SELECT base_vnd FROM fee_config) + sum(cost)
         FROM costs GROUP BY house
-    """, (month, day, month, month, day, next_month(day)))
-    # October is a deliberately short opening period; a full closed month is required to resize.
-    if month > date(2026, 10, 1):
-        make_plan(conn, month, day)
+    """, (month, day, month, month, day, day, next_month(day)))
+    make_plan(conn, month, day)
     log(conn, "billing", "info", f"Đã chốt kỳ {month:%Y-%m}; phát hành hóa đơn cho từng hộ")
     return month
 
 
 def make_plan(conn, month, day):
+    active_days = max(1, (day - max(month, date(2026, 10, 30))).days)
     conn.execute("""
         WITH history AS (
           SELECT bin,sum(generated_g) AS generated,sum(pickups) AS pickups FROM daily
@@ -64,8 +66,9 @@ def make_plan(conn, month, day):
                  WHEN (capacity_l,interval_h) = (suggested_l,suggested_h) THEN 'unchanged'
                  ELSE 'applied' END, forecast_g
         FROM proposal
-    """, (month, day, (day - month).days, (next_month(day)-day).days,
-          (day - month).days, month, day))
+        ON CONFLICT(month,bin) DO NOTHING
+    """, (month, day, active_days, (next_month(day)-day).days,
+          active_days, month, day))
     conn.execute("""
         UPDATE bin b SET capacity_l=p.after_l,interval_h=p.after_h
         FROM plan p WHERE p.bin=b.id AND p.month=%s AND p.result='applied'
@@ -82,26 +85,70 @@ def make_plan(conn, month, day):
             AND (e.occurred AT TIME ZONE 'Asia/Ho_Chi_Minh')::date >= %s
             AND (e.occurred AT TIME ZONE 'Asia/Ho_Chi_Minh')::date < %s
           GROUP BY t.zone,t.category
+        ), current_fleet AS (
+          SELECT zone,category,count(*) FILTER(WHERE status<>'standby') AS active_cnt
+          FROM truck GROUP BY zone,category
         )
         INSERT INTO fleet_plan
-        SELECT %s,d.zone,d.category,1,
-          CASE WHEN d.stops > %s*9 THEN 2 ELSE 1 END,coalesce(t.n,0),d.grams
+        SELECT %s,d.zone,d.category,coalesce(c.active_cnt,1),
+          CASE WHEN coalesce(t.n,0) > %s*4.8 OR (d.zone <= 4 AND d.category='organic') THEN 2 ELSE 1 END,
+          coalesce(t.n,0),d.grams
         FROM demand d LEFT JOIN trips t USING(zone,category)
-    """, (month, day, month, day, month, (day-month).days))
-    log(conn, "planning", "info", "Đã áp dụng dung tích/tần suất và tính đề xuất đội xe theo kỳ")
+        LEFT JOIN current_fleet c USING(zone,category)
+        ON CONFLICT(month,zone,category) DO NOTHING
+    """, (month, day, month, day, month, active_days))
+    conn.execute("""
+        INSERT INTO truck(id,zone,category,capacity_g,status)
+        SELECT 'X-'||lpad(f.zone::text,2,'0')||'-'||
+               CASE f.category WHEN 'organic' THEN 'O' WHEN 'recycle' THEN 'R' ELSE 'C' END||'-2',
+               f.zone,f.category,
+               CASE f.category WHEN 'organic' THEN 22000 WHEN 'recycle' THEN 13000 ELSE 18000 END,
+               'idle'
+        FROM fleet_plan f WHERE f.month=%s AND f.suggested=2
+        ON CONFLICT(id) DO UPDATE SET status=CASE WHEN truck.status='standby' THEN 'idle' ELSE truck.status END
+    """, (month,))
+    conn.execute("""
+        UPDATE truck t SET status='standby'
+        FROM fleet_plan f
+        WHERE f.month=%s AND f.zone=t.zone AND f.category=t.category AND f.suggested=1
+          AND t.id LIKE '%%-2' AND t.load_g=0 AND t.status='idle'
+          AND NOT EXISTS(SELECT 1 FROM task k WHERE k.truck=t.id AND k.status IN ('assigned','collecting'))
+    """, (month,))
+    log(conn, "planning", "info", "Đã tự động điều chỉnh dung tích/tần suất và tăng/giảm số lượng xe theo khu")
 
 
-def simulated_payments(conn, start, end, emit):
+def simulated_payments(conn, start, end, emit, step=0):
+    late_house = "H-0120" if step == 71 else ("H-0340" if step == 73 else None)
+    if late_house:
+        unpaid = conn.execute("""
+            SELECT i.* FROM invoice i
+            WHERE i.house = %s
+              AND NOT EXISTS (
+                SELECT 1 FROM payment_attempt p
+                WHERE p.invoice_ref = i.id AND p.status = 'matched'
+              )
+            ORDER BY i.month
+        """, (late_house,)).fetchall()
+        paid_at = start + timedelta(minutes=10)
+        for inv in unpaid:
+            tx = f"TX-{inv['id']}-LATE"
+            emit("payment", late_house, paid_at, inv["total_vnd"], "vnd",
+                 data={"tx": tx, "invoice": inv["id"], "house": late_house})
+        if unpaid:
+            bin_code = "H-0120-C (Khu 02)" if late_house == "H-0120" else "H-0340-R (Khu 06)"
+            log(conn, "billing", "info",
+                f"Hộ {late_house} đã thanh toán bù {len(unpaid)} hóa đơn quá hạn; mở lại thu gom thùng {bin_code}")
+
     rows = conn.execute("""
         SELECT i.*, substring(h.id from '[0-9]+$')::int AS ordinal
         FROM invoice i JOIN household h ON h.id=i.house
         WHERE i.issued >= %s::date-40 AND i.issued <= %s::date
     """, (start.date(), end.date())).fetchall()
     for row in rows:
-        profile = row["ordinal"] % 20
-        if profile == 0:
-            continue  # persistently unpaid
-        delay = 32 if profile == 1 else (0 if profile < 5 else 1 + row["ordinal"] % 16)
+        profile = row["ordinal"] % 100
+        if profile in (0, 20, 40) and row["house"] not in ("H-0120", "H-0340"):
+            continue  # 3% cố định không thanh toán -> ngừng gom sau 1 tháng
+        delay = 0 if profile in (5, 19, 25) else 1 + row["ordinal"] % 24
         due = row["issued"] + timedelta(days=delay)
         hour = 2 + row["ordinal"] % 20
         paid_at = datetime.combine(due, datetime.min.time(), VN) + timedelta(hours=hour)
@@ -110,15 +157,15 @@ def simulated_payments(conn, start, end, emit):
         tx = "TX-" + row["id"]
         data = {"tx": tx, "invoice": row["id"], "house": row["house"]}
         amount = row["total_vnd"]
-        if profile == 2:
-            amount += 2000
-        if profile == 3 and row["ordinal"] % 100 == 3:
-            data = {**data, "invoice": "SAI-" + row["id"]}
-        if profile == 6 and row["ordinal"] % 100 == 6:
-            data = {**data, "house": "H-SAI"}
+        if profile == 19:
+            amount = max(1000, amount - 2000)  # 1% đóng thiếu -> ngừng gom sau 1 tháng
+        elif profile in (5, 25):
+            amount += 2000  # 2% đóng thừa tiền -> vẫn gom, liên hệ hoàn tiền thừa
+        if row["ordinal"] % 200 == 7:
+            data = {**data, "invoice": "SAI-" + row["id"]}  # 0.5% sai mã HĐ
+        if row["ordinal"] % 200 == 6:
+            data = {**data, "house": "H-SAI"}  # 0.5% sai mã hộ
         emit("payment", row["house"], paid_at, amount, "vnd", data=data)
         if row["ordinal"] % 100 == 4:
             emit("payment", row["house"], paid_at, amount, "vnd", data=data)
-            emit("payment", row["house"], paid_at, amount+1, "vnd", data=data)
-            emit("payment", row["house"], paid_at, amount, "vnd", data={**data, "tx": tx+"-B"})
 

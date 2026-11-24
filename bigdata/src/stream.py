@@ -15,6 +15,29 @@ SCHEMA = """
     data struct<tx:string,invoice:string,house:string,state:string,bin:string,reason:string,truck:string,km:double>
 """
 HDFS = "hdfs://namenode:8020/waste"
+EPOCH_OFFSET = 0
+
+BASELINE_TABLES = [
+    ("tariff", False),
+    ("fee_config", False),
+    ("household", False),
+    ("bin", False),
+    ("physical_bin", False),
+    ("truck", False),
+    ("task", True),
+    ("closed_month", False),
+    ("invoice", False),
+    ("event", False),
+    ("transaction_key", False),
+    ("payment_attempt", False),
+    ("bin_state", False),
+    ("daily", False),
+    ("microbatch", False),
+    ("quality_log", False),
+    ("system_log", True),
+    ("plan", False),
+    ("fleet_plan", False),
+]
 
 
 def classify(batch):
@@ -82,11 +105,13 @@ def reconcile(conn, row):
         if invoice:
             if invoice["house"] != house:
                 reason = "house_mismatch"
-            elif invoice["total_vnd"] != amount:
-                reason = "amount_mismatch"
+            elif amount < invoice["total_vnd"]:
+                reason = "underpaid"
             elif conn.execute("SELECT 1 FROM payment_attempt WHERE invoice_ref=%s AND status='matched'",
                               (ref,)).fetchone():
                 reason = "invoice_already_paid"
+            elif amount > invoice["total_vnd"]:
+                status, reason = "matched", "overpaid_refund"
             else:
                 status, reason = "matched", "exact_match"
     conn.execute("INSERT INTO payment_attempt VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -108,6 +133,9 @@ def archive(df, aggregates, epoch):
 
 
 def process(batch, epoch):
+    if batch.isEmpty():
+        return
+    epoch = EPOCH_OFFSET + epoch
     started = time.monotonic()
     with connect() as conn:
         if conn.execute("SELECT 1 FROM microbatch WHERE id=%s", (epoch,)).fetchone():
@@ -170,8 +198,10 @@ def process(batch, epoch):
                       generated_g=daily.generated_g+excluded.generated_g,
                       collected_g=daily.collected_g+excluded.collected_g,pickups=daily.pickups+excluded.pickups
                 """, [tuple(r) for r in aggregates.collect()])
-                cursor.executemany("INSERT INTO quality_log(topic,part,kafka_offset,reason,raw) VALUES(%s,%s,%s,%s,%s)",
-                                   [(r.topic,r.partition,r.offset,r.reason,r.raw) for r in rejected])
+                cursor.executemany(
+                    "INSERT INTO quality_log(topic,part,kafka_offset,reason,raw) VALUES(%s,%s,%s,%s,%s) "
+                    "ON CONFLICT(topic,part,kafka_offset) DO UPDATE SET reason=excluded.reason,raw=excluded.raw,received=now()",
+                    [(r.topic, r.partition, r.offset, r.reason, r.raw) for r in rejected])
                 cursor.executemany("""
                     INSERT INTO kafka_cursor VALUES(%s,%s,%s) ON CONFLICT(topic,part) DO UPDATE
                     SET kafka_offset=greatest(excluded.kafka_offset,kafka_cursor.kafka_offset)
@@ -189,12 +219,74 @@ def process(batch, epoch):
             parsed.unpersist()
 
 
+def restore_baseline(spark):
+    with connect() as conn:
+        if not conn.execute("SELECT to_regclass('base.demo') IS NOT NULL AS ok").fetchone()["ok"]:
+            conn.execute("UPDATE demo SET mode='paused', waiting=NULL WHERE id")
+            return
+        max_batch = conn.execute("SELECT coalesce(max(id), -1) AS m FROM base.microbatch").fetchone()["m"]
+        names = "public.kafka_produced, public.kafka_cursor, " + ", ".join(f"public.{t}" for t, _ in BASELINE_TABLES)
+        conn.execute(f"TRUNCATE {names} RESTART IDENTITY CASCADE")
+        for tbl, has_identity in BASELINE_TABLES:
+            override = "OVERRIDING SYSTEM VALUE " if has_identity else ""
+            conn.execute(f"INSERT INTO public.{tbl} {override}SELECT * FROM base.{tbl}")
+            if has_identity:
+                conn.execute(
+                    f"SELECT setval(pg_get_serial_sequence('public.{tbl}','id'), "
+                    f"coalesce((SELECT max(id) FROM public.{tbl}), 1), "
+                    f"(SELECT EXISTS(SELECT 1 FROM public.{tbl})))"
+                )
+        conn.execute(
+            "UPDATE public.demo d SET mode='paused', clock=b.clock, step=b.step, "
+            "seed=b.seed, scenario='normal', waiting='reset_kafka' FROM base.demo b"
+        )
+    Path = spark._jvm.org.apache.hadoop.fs.Path
+    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+        spark._jvm.java.net.URI(HDFS), spark._jsc.hadoopConfiguration()
+    )
+    fs.delete(Path(f"{HDFS}/checkpoint"), True)
+    batches_path = Path(f"{HDFS}/batches")
+    if fs.exists(batches_path):
+        for item in fs.listStatus(batches_path):
+            name = item.getPath().getName()
+            if name.isdigit() and int(name) > max_batch:
+                fs.delete(item.getPath(), True)
+
+
 if __name__ == "__main__":
     spark = SparkSession.builder.appName("Waste • Kafka → HDFS + PostgreSQL").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
-    source = (spark.readStream.format("kafka").option("kafka.bootstrap.servers", "kafka:9092")
-              .option("subscribe", ",".join(TOPICS)).option("startingOffsets", "earliest")
-              .option("maxOffsetsPerTrigger", 12000).load())
-    (source.writeStream.foreachBatch(process).option("checkpointLocation", f"{HDFS}/checkpoint")
-        .trigger(processingTime="3 seconds").start().awaitTermination())
+    while True:
+        with connect() as conn:
+            w = conn.execute("SELECT waiting FROM demo").fetchone()["waiting"]
+            if w == "resetting":
+                restore_baseline(spark)
+                continue
+            if w == "reset_kafka":
+                time.sleep(0.5)
+                continue
+            EPOCH_OFFSET = conn.execute("SELECT coalesce(max(id), -1) + 1 AS n FROM microbatch").fetchone()["n"]
+        source = (spark.readStream.format("kafka").option("kafka.bootstrap.servers", "kafka:9092")
+                  .option("subscribe", ",".join(TOPICS)).option("startingOffsets", "earliest")
+                  .option("maxOffsetsPerTrigger", 12000).load())
+        query = (source.writeStream.foreachBatch(process).option("checkpointLocation", f"{HDFS}/checkpoint")
+                 .trigger(processingTime="3 seconds").start())
+        stopped_for_reset = False
+        while query.isActive:
+            time.sleep(0.8)
+            try:
+                with connect() as conn:
+                    w = conn.execute("SELECT waiting FROM demo").fetchone()["waiting"]
+                if w == "resetting":
+                    stopped_for_reset = True
+                    wait_end = time.monotonic() + 12
+                    while query.isActive and query.status.get("isTriggerActive") and time.monotonic() < wait_end:
+                        time.sleep(0.2)
+                    query.stop()
+                    restore_baseline(spark)
+                    break
+            except Exception:
+                pass
+        if not stopped_for_reset and not query.isActive and query.exception():
+            raise query.exception()
 

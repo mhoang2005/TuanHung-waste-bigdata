@@ -1,7 +1,6 @@
 import json
 import threading
 import time
-from urllib.request import Request, urlopen
 
 from confluent_kafka import KafkaError, KafkaException, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
@@ -10,11 +9,9 @@ from db import TOPICS, connect, log
 from simulation import frame, seed_catalog
 
 BROKER = {"bootstrap.servers": "kafka:9092"}
-producer = Producer({**BROKER, "enable.idempotence": True, "delivery.timeout.ms": 10000, "linger.ms": 15})
+producer = Producer({**BROKER, "enable.idempotence": True, "delivery.timeout.ms": 15000, "linger.ms": 15})
 send_lock = threading.Lock()
-SEND_BATCH_SIZE = 550
-SEND_RATE = 1100
-MAX_KAFKA_BACKLOG = 16000
+MAX_KAFKA_BACKLOG = 40000
 
 
 def prepare_topics():
@@ -32,15 +29,51 @@ def prepare_topics():
                 raise
 
 
+def recreate_topics():
+    global producer
+    admin = AdminClient(BROKER)
+    existing = admin.list_topics(timeout=6).topics
+    present = [t for t in TOPICS if t in existing]
+    if present:
+        futures = admin.delete_topics(present, operation_timeout=10)
+        for future in futures.values():
+            try:
+                future.result(10)
+            except KafkaException as error:
+                if error.args[0].code() != KafkaError.UNKNOWN_TOPIC_OR_PART:
+                    raise
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        current = admin.list_topics(timeout=5).topics
+        if not any(t in current for t in TOPICS):
+            break
+        time.sleep(0.3)
+    while True:
+        try:
+            prepare_topics()
+            with send_lock:
+                producer = Producer({**BROKER, "enable.idempotence": True, "delivery.timeout.ms": 15000, "linger.ms": 15})
+            return
+        except KafkaException as error:
+            if error.args[0].code() == KafkaError.TOPIC_ALREADY_EXISTS and time.monotonic() < deadline:
+                time.sleep(0.3)
+                continue
+            raise
+
+
 def publish(records):
-    results = {}
+    if not records:
+        return {}
+    offsets = {}
     errors = []
 
-    def delivered(index, err, msg):
+    def delivered(err, msg):
         if err:
             errors.append(str(err))
         else:
-            results[index] = [msg.topic(), msg.partition(), msg.offset()]
+            key = (msg.topic(), msg.partition())
+            if msg.offset() > offsets.get(key, -1):
+                offsets[key] = msg.offset()
 
     with send_lock:
         for index, body in enumerate(records):
@@ -50,63 +83,38 @@ def publish(records):
             key = (data.get("invoice") or body.get("subject")) if payment else body.get("subject")
             producer.produce(topic, key=str(key or "invalid").strip().upper(),
                              value=json.dumps(body, separators=(",", ":"), ensure_ascii=False),
-                             on_delivery=lambda err,msg,i=index: delivered(i,err,msg))
-        if producer.flush(12) or errors:
+                             on_delivery=delivered)
+            if index % 1000 == 999:
+                producer.poll(0)
+        if producer.flush(15) or errors:
             raise RuntimeError(errors[0] if errors else "Kafka chưa xác nhận đủ sự kiện")
-    return [results[i] for i in range(len(records))]
-
-
-def pump():
-    with connect() as conn:
-        items = conn.execute("""
-            SELECT id,body FROM outbox WHERE kafka_offset IS NULL AND due <= (SELECT clock FROM demo)
-            ORDER BY id LIMIT %s
-        """, (SEND_BATCH_SIZE,)).fetchall()
-    if not items:
-        return False
-    started = time.monotonic()
-    request = Request("http://127.0.0.1:8000/api/events",
-                      data=json.dumps([item["body"] for item in items]).encode(),
-                      headers={"Content-Type": "application/json"})
-    with urlopen(request, timeout=18) as response:
-        ack = json.load(response)["offsets"]
-    with connect() as conn:
-        conn.execute("""
-            UPDATE outbox o SET topic=x.t,part=x.p,kafka_offset=x.k
-            FROM unnest(%s::bigint[],%s::text[],%s::int[],%s::bigint[]) AS x(id,t,p,k) WHERE o.id=x.id
-        """, ([r["id"] for r in items], *map(list, zip(*ack))))
-    time.sleep(max(0, len(items) / SEND_RATE - (time.monotonic() - started)))
-    return True
+    return offsets
 
 
 def simulate():
     with connect() as conn:
         state = conn.execute("SELECT * FROM demo FOR UPDATE").fetchone()
+        if state["waiting"] in ("resetting", "reset_kafka"):
+            return
         seed_catalog(conn, state["seed"])
         if state["mode"] != "running":
             return
-        # Spark advances this cursor only after HDFS and the serving transaction succeed.
-        conn.execute("""
-            DELETE FROM outbox o USING kafka_cursor c
-            WHERE o.topic=c.topic AND o.part=c.part AND o.kafka_offset<=c.kafka_offset
-        """)
+        if conn.execute("SELECT to_regclass('base.demo') IS NOT NULL AS ok").fetchone()["ok"]:
+            base_step = conn.execute("SELECT step FROM base.demo").fetchone()["step"]
+            if state["step"] >= base_step + 180:
+                conn.execute("UPDATE demo SET mode='paused', waiting='cycle_done' WHERE id")
+                log(conn, "control", "info", "Đã hoàn tất 1 chu kỳ demo (90 ngày mô phỏng); bấm 'Đặt lại demo' hoặc 'Bật demo' để chạy chu kỳ mới")
+                return
         pending = conn.execute("""
-            SELECT count(*) AS n FROM (
-              SELECT 1 FROM outbox o LEFT JOIN kafka_cursor c USING(topic,part)
-              WHERE o.kafka_offset > coalesce(c.kafka_offset,-1) LIMIT %s
-            ) pending
-        """, (MAX_KAFKA_BACKLOG,)).fetchone()["n"]
+            SELECT coalesce(sum(greatest(0, p.kafka_offset - coalesce(c.kafka_offset, -1))), 0) AS n
+            FROM kafka_produced p LEFT JOIN kafka_cursor c USING(topic, part)
+        """).fetchone()["n"]
         if pending >= MAX_KAFKA_BACKLOG:
             conn.execute("UPDATE demo SET waiting='pipeline' WHERE id")
             return
-        sending = conn.execute("""
-            SELECT EXISTS(SELECT 1 FROM outbox WHERE kafka_offset IS NULL AND due <= %s) AS pending
-        """, (state["clock"],)).fetchone()["pending"]
-        if sending:
-            if state["waiting"] == "pipeline":
-                conn.execute("UPDATE demo SET waiting=NULL WHERE id")
-            return
-        frame(conn, state)
+        if state["waiting"] == "pipeline":
+            conn.execute("UPDATE demo SET waiting=NULL WHERE id")
+        frame(conn, state, publish)
 
 
 def loop(stop, component, task, idle):
@@ -116,7 +124,7 @@ def loop(stop, component, task, idle):
             active = task()
             if last_error:
                 with connect() as conn:
-                    log(conn,component,"info","Đã phục hồi")
+                    log(conn, component, "info", "Đã phục hồi")
             last_error = None
             if not active:
                 stop.wait(idle)
@@ -126,9 +134,8 @@ def loop(stop, component, task, idle):
                 print(f"{component}: {message}", flush=True)
                 try:
                     with connect() as conn:
-                        log(conn,component,"error",message)
+                        log(conn, component, "error", message)
                 except Exception:
                     pass
                 last_error = message
             stop.wait(2)
-

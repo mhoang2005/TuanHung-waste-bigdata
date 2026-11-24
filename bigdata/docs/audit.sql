@@ -26,7 +26,7 @@ WHERE detail->>'category'=b.category AND (detail->>'grams')::bigint <>
    WHERE d.bin=b.id AND d.day>=i.month AND d.day<i.month+interval '1 month');
 
 SELECT count(*) AS wrong_payment_amounts FROM payment_attempt p JOIN invoice i ON p.invoice_ref=i.id
-WHERE p.status='matched' AND (p.amount<>i.total_vnd OR p.house<>i.house);
+WHERE p.status='matched' AND (p.amount<i.total_vnd OR p.house<>i.house);
 
 SELECT month,result,count(*) FROM plan GROUP BY 1,2 ORDER BY 1,2;
 SELECT date_trunc('minute',occurred AT TIME ZONE 'Asia/Ho_Chi_Minh') AS simulated_minute,
