@@ -70,18 +70,25 @@ flowchart LR
    - Trong một khung 12 giờ: xe Hữu cơ chạy tối đa **4 chuyến**, xe Tái chế và Còn lại chạy tối đa **2 chuyến**.
    - Nếu lượng rác trong thùng nhiều hơn tải trọng còn trống của xe (`available = capacity_g - load_g`), xe bốc đầy tải còn trống (`Gom một phần - partial`), phần rác còn lại trong thùng được giữ nguyên để chuyến sau gom tiếp. Cuối chuyến xe chạy về trạm đổ rác (`dump`), đưa `load_g` về `0` và cộng dồn vào `dumped_g`.
 
-4. **Xử lý sự cố vận hành (Tự động tích hợp trong kịch bản demo):**
-   - **Thùng mất tín hiệu IoT (`lost`)**: Khi cảm biến mất kết nối (tối đa 19 thùng đồng thời), hệ thống đánh dấu `Mất tín hiệu cảm biến` trong 24 giờ mô phỏng rồi tự khôi phục (`restored`).
-   - **Xe hỏng giữa chuyến (`broken`)**: Khi xe gặp sự cố, lượng rác đã bốc lên xe được **giữ nguyên trên xe** (đảm bảo định luật bảo toàn khối lượng), còn các điểm đã phân công nhưng xe chưa kịp tới gom được đổi trạng thái sang **`Mở lại chờ xe (requeued)`** để gom ở khung tiếp theo sau khi xe sửa xong (`recovered`).
+4. **Chế độ `Theo dõi 30 thùng mẫu` & `Tất cả các thùng (10.800)` + Xử lý sự cố vận hành:**
+   - Mặc định Bước 1 hiển thị **`Theo dõi 30 thùng mẫu`** (khung bảng hiển thị 13 dòng cùng lúc, bên cạnh nút chuyển sang **`Tất cả các thùng 10.800`**):
+     - Các thùng gặp sự cố (`📡 Cảm biến hỏng · Đang sửa`, `🔧 Xe ... đang sửa`) và thùng chưa được thu gom tự động được **đẩy lên đầu bảng theo mức độ cảnh báo** (`Quá tải >100%` → `Đã đầy 95–100%` → `Gần đầy 75–94%` → `Để quá lâu`).
+     - Các dòng thùng vừa được xe thu gom sẽ bật **hiệu ứng sáng xanh ngọc (`✓ Vừa gom xong X-..-..`)** rồi tự động trôi xuống nhóm dưới.
+     - **Kịch bản thanh toán nợ trực tiếp trong ~35 giây đầu:** Ở mốc chuẩn ban đầu (`step = 70`), trong 30 thùng mẫu có 3 thùng bị ngừng gom do nợ quá hạn (`H-0120-C`, `H-0340-R`, `H-0020-O`). Khi bật demo, ở khoảng giây 15–25 hộ `H-0120` đóng tiền và được xe `X-02-C` thu gom ngay; ở khoảng giây 25–35 hộ `H-0340` đóng tiền và được xe `X-06-R` thu gom ngay; cuối cùng chỉ còn duy nhất 1 thùng `H-0020-O` cố định ở trạng thái **`⛔ Nợ quá hạn · ⛔ Ngừng gom`**.
+   - **Thùng mất tín hiệu IoT (`lost`)**: Khi cảm biến mất kết nối (tối đa 19 thùng đồng thời), hệ thống đánh dấu `📡 Cảm biến hỏng · Đang sửa` rồi tự khôi phục (`restored`) ở bước kế tiếp.
+   - **Xe hỏng giữa chuyến (`broken`)**: Khi xe gặp sự cố, lượng rác đã bốc lên xe được **giữ nguyên trên xe** (đảm bảo định luật bảo toàn khối lượng), còn các điểm đã phân công nhưng xe chưa kịp tới gom được đổi trạng thái sang **`↻ Chờ xe thay thế (requeued)`** để gom ngay sau khi xe sửa xong (`recovered`).
 
 ---
 
-### BƯỚC 2: Thống kê & Trực quan hóa khối lượng rác (Tab 02 - `Thống kê khối lượng`)
+### BƯỚC 2: Thống kê & Biểu đồ trực quan khối lượng rác (Tab 02 - `Thống kê & Biểu đồ`)
 
 - Dữ liệu sự kiện phát sinh (`deposit`) và sự kiện xe thu gom (`pickup`) sau khi được **Spark Structured Streaming** làm sạch và khử trùng sẽ được cộng dồn theo từng ngày, từng thùng vào bảng `daily` (và lưu Parquet lớp `layer=analysis` trên HDFS).
-- Trang Bước 2 trực quan hóa:
-  - **3 chỉ số tổng hợp kỳ**: Tổng khối lượng rác phát sinh (kg), Tổng khối lượng xe đã thu gom (kg), và Khối lượng rác còn tồn trong thùng cuối kỳ (kg).
-  - **Biểu đồ cột kép theo ngày**: So sánh trực quan lượng phát sinh (màu xanh đậm) và lượng đã gom (màu xanh nhạt) qua từng ngày trong tháng.
+- Trang Bước 2 trực quan hóa bằng **4 thẻ KPI tổng hợp** và **5 biểu đồ tương tác (có tooltip chi tiết khi rê chuột)**:
+  - **Biểu đồ 1 — Phát sinh vs Đã thu gom theo ngày**: So sánh trực quan lượng phát sinh và lượng đã gom qua từng ngày trong tháng.
+  - **Biểu đồ 2 — Phân bố thu gom theo 24 khung giờ trong ngày**: Thể hiện rõ **2 khung giờ cao điểm** (`05:00–06:59` sáng và `17:00–20:59` tối chiếm ~80% sản lượng) cùng các chuyến thu gom rải rác ở khung giờ thấp điểm (~20%).
+  - **Biểu đồ 3 — Top 15 Khu dân cư có khối lượng thu gom cao nhất**: Xếp hạng trực quan các khu có tải lượng lớn.
+  - **Biểu đồ 4 — Cơ cấu 3 loại rác & Hiệu suất thu gom theo tháng**: Tỷ trọng Hữu cơ / Tái chế / Còn lại và tỷ lệ thu gom các kỳ.
+  - **Biểu đồ 5 — Đối soát Doanh thu Phát hành vs Thực thu theo tháng**: So sánh tiền hóa đơn phát hành, đã thu và còn nợ.
   - **Bảng phân tích chi tiết**:
     - Khi để bộ lọc `Tất cả 60 khu`: Bảng tổng hợp theo từng Khu (`Khu 01` .. `Khu 60`) × 3 loại rác.
     - Khi chọn 1 khu cụ thể (VD: `Khu 01`) hoặc gõ tìm mã hộ (VD: `H-0001`): Bảng bung chi tiết khối lượng phát sinh, khối lượng đã gom và số lượt xe đến gom của từng hộ gia đình.
@@ -144,7 +151,7 @@ Ngay khi kết thúc một tháng (vào lúc `00:00` ngày `01` của tháng k�
         - Nhật ký đối soát gắn nhãn **`Thừa tiền (Đã gom · Liên hệ hoàn tiền)`**.
      6. **Gửi sai mã hóa đơn (`invoice_not_found`), sai mã hộ (`house_mismatch`) hoặc gửi trùng giao dịch (`same_transaction`)**:
         - Giao dịch gửi trùng cùng mã `TX` được hệ thống tự động lọc bỏ (idempotent, không cộng tiền 2 lần).
-        - Giao dịch sai mã hóa đơn hoặc sai mã hộ được giữ lại trong log đối soát kèm hướng dẫn người dân liên hệ trực tiếp bộ phận hỗ trợ bên ngoài hệ thống (**Phòng Tài Chính & Đối Soát — Hotline: `1900 6886` · Email: `doisoat@tuanhung.vn`**) để hoàn tiền hoặc điều chỉnh.
+        - Giao dịch sai mã hóa đơn hoặc sai mã hộ được giữ lại trong log đối soát kèm hướng dẫn người dân liên hệ trực tiếp bộ phận hỗ trợ bên ngoài hệ thống (**Phòng Tài Chính & Đối Soát — SĐT: `0392196240` · Email: `doisoat@tuanhung.vn`**) để hoàn tiền hoặc điều chỉnh.
 
 ---
 
@@ -304,48 +311,42 @@ docker compose down
 
 ## 6. KỊCH BẢN DEMO & THUYẾT TRÌNH 5 PHÚT TRÊN LỚP
 
-> **Trạng thái dữ liệu đã chuẩn bị sẵn:** Hệ thống hiện đã có sẵn **~2,77 triệu bản ghi** đi qua Kafka → Spark → HDFS (~628 MB file Parquet) qua 3 kỳ tháng đã chốt (`2026-10`, `2026-11`, `2026-12`). Bạn chỉ cần bấm **`▶ Bật demo`** là hệ thống vừa có sẵn toàn bộ lịch sử để chiếu ngay, vừa nhảy số liệu trực tiếp trong 5 phút thuyết trình.
+> **Trạng thái dữ liệu mốc chuẩn (`step = 70 · 00:00 04/12/2026`):** Hệ thống đã nạp sẵn **2 kỳ tháng hoàn chỉnh (`2026-10`, `2026-11`)** trong schema `base.*` với đúng **5% hộ nợ quá hạn (`180 hộ / 540 thùng`)**, có thể bấm **`↺ Đặt lại demo`** bất cứ lúc nào để khôi phục về đúng mốc `step = 70` chỉ trong ~15–20 giây. Mỗi lần bấm **`↺ Đặt lại demo` → `▶ Bật demo`**, kịch bản diễn biến giống hệt nhau 100%.
 
-### ⏱ Phút 1: Mở đầu & Bước 1 — Cảm biến báo đầy & Điều xe thu gom
-1. Mở **`http://localhost:8000`**, bấm nút **`▶ Bật demo`** ở góc trên bên phải.
-2. Chỉ vào **Thanh Vòng Tròn Nghiệp Vụ Khép Kín** ở đầu trang để giới thiệu tổng quan 4 bước.
-3. Tại **Bước 1 (`Cảnh báo & điều xe`)**:
-   - Chỉ vào **6 ô thẻ tổng quan**: Hệ thống đang theo dõi 10.800 thùng rác của 3.600 hộ; hiển thị rõ tổng lượng rác đang tồn trong thùng (~39,4 tấn), số hộ đang báo đầy cần gom, số xe đang hoạt động (đã tự động tăng cường lên >200 xe), số thùng mất tín hiệu IoT và số xe đang gặp sự cố.
-   - Chỉ vào **Bảng danh sách thùng rác**:
-     - Cột `% Thể tích đầy` có thanh màu trực quan: **Gần đầy (75–94%)**, **Đã đầy (95–100%)**, **Quá tải (>100%)** và nhãn **Để quá lâu**.
-     - Cột `Quyết định điều xe` hiển thị xe đang được phân công đi gom (`Đã phân xe`, `Đã gom xong`, `Gom một phần`).
-     - **Thao tác ăn điểm:** Chọn ô **`Lọc trạng thái → Bỏ qua (Ngừng gom do nợ)`** để chỉ cho giảng viên thấy các hộ như **`H-0019`**, **`H-0020`** dù thùng đang đầy nhưng bị hệ thống gắn nhãn **`Bỏ qua (Ngừng gom)`** do nợ/đóng thiếu tiền quá 1 tháng.
+### ⏱ Phút 1: Mở đầu & Bước 1 — Cảm biến báo đầy & Điều xe thu gom trực tiếp
+1. Mở **`http://localhost:8000`**, giới thiệu **Thanh Vòng Tròn Nghiệp Vụ Khép Kín 4 Bước + Hạ tầng Big Data** rồi bấm **`▶ Bật demo`**.
+2. Tại **Bước 1 (`01 · Cảnh báo & Điều xe`)**:
+   - Chỉ vào **6 thẻ KPI tổng quan**: Hiển thị rõ lượng rác đang tồn trong thùng, **Tỷ lệ nhà cần gom / Tổng số nhà (%)**, **Tỷ lệ thùng & hộ để quá lâu (%)**, **Tỷ lệ quá tải (>100%)**, số xe đang hoạt động (`187 xe`) và số thùng mất tín hiệu IoT.
+   - Chỉ vào **Bảng `Theo dõi 30 thùng mẫu`** (hiển thị 13 dòng đồng thời, có nút chuyển sang **`Tất cả các thùng 10.800`**):
+     - Các thùng gặp sự cố (`📡 Cảm biến hỏng · Đang sửa`, `🔧 Xe ... đang sửa`) và thùng quá tải/chưa gom tự động **được đẩy lên đầu bảng theo mức cảnh báo**.
+     - Khi xe vừa thu gom xong, dòng thùng đó sáng **hiệu ứng xanh ngọc (`✓ Vừa gom xong X-..-..`)** rồi trôi xuống cuối bảng.
+     - **Điểm nhấn trong 35 giây đầu:** Lúc mới bật có 3 thùng nợ quá hạn (`H-0120-C`, `H-0340-R`, `H-0020-O`). Sau ~20–35 giây chạy demo, 2 hộ `H-0120` và `H-0340` lần lượt đóng tiền bù, chuyển sang `● Đã đóng` và được xe vào gom sạch ngay trước mắt; cuối cùng chỉ còn duy nhất 1 thùng **`H-0020-O`** bị gắn nhãn **`⛔ Nợ quá hạn · ⛔ Ngừng gom`**.
 
-### ⏱ Phút 2: Bước 2 — Thống kê khối lượng rác theo Khu & Hộ
-1. Bấm vào ô **`Bước 2: Thống kê khối lượng`** trên thanh vòng tròn nghiệp vụ.
-2. Chỉ vào **Biểu đồ cột kép**: So sánh lượng rác **Phát sinh (xanh đậm)** và lượng rác **Đã thu gom (xanh nhạt)** theo từng ngày trong tháng.
-3. Chỉ vào **Bảng thống kê chi tiết**:
-   - Đang hiển thị khối lượng phát sinh, đã gom và số lượt gom của từng Khu (`Khu 01`..`Khu 60`) theo 3 loại rác (`Hữu cơ`, `Tái chế`, `Còn lại`).
-   - Chọn thử **`Khu dân cư → Khu 01`**: Bảng lập tức bung ra chi tiết từng hộ gia đình (`H-0001`, `H-0002`...). Giải thích đây chính là dữ liệu sạch do Spark tổng hợp để đưa sang Bước 3 và Bước 4.
+### ⏱ Phút 2: Bước 2 — Thống kê & 5 Biểu đồ phân tích đa chiều
+1. Bấm vào **`Bước 2: Thống kê khối lượng`** (`02 · Thống kê & Biểu đồ`).
+2. Rê chuột qua **5 biểu đồ tương tác (có tooltip chi tiết)**:
+   - **Biểu đồ Ngày**: So sánh lượng rác Phát sinh và Đã thu gom theo từng ngày trong tháng.
+   - **Biểu đồ 24 Khung giờ**: Chỉ rõ 2 đỉnh cao điểm sáng (`05–06h`) và tối (`17–20h`) chiếm ~80% lượng thu gom, cùng các khung giờ thấp điểm vẫn có xe gom rải rác (~20%).
+   - **Biểu đồ Top 15 Khu dân cư**, **Cơ cấu 3 loại rác & Hiệu suất các tháng**, và **Doanh thu Phát hành vs Thực thu**.
+3. Cuộn xuống **Bảng thống kê chi tiết**: Chọn thử **`Khu dân cư → Khu 01`** để bung chi tiết từng hộ gia đình (`H-0001`, `H-0002`...).
 
 ### ⏱ Phút 3: Bước 3 — Tự động chỉnh Thể tích thùng, Lịch gom & Đội xe
-1. Bấm vào ô **`Bước 3: Tự động chỉnh Thùng · Lịch · Xe`** (trả bộ lọc Khu về `Tất cả 60 khu`).
+1. Bấm vào **`Bước 3: Quy hoạch Thùng · Xe`** (`03 · Quy hoạch tự động`, trả bộ lọc Khu về `Tất cả 60 khu`).
 2. Chỉ vào **Bảng 1 (Tự động tăng/giảm thùng rác ±5L & lịch gom ±24h cho từng hộ)**:
-   - Ngay những dòng đầu tiên đã hiển thị đủ các trường hợp:
-     - Hộ phát sinh nhiều (>80% sức chứa): Tăng thùng **`20 L → 25 L`** (hoặc `25 L → 30 L`) và rút ngắn lịch gom **`72h → 48h`** (`Đã tự động áp dụng`).
-     - Hộ phát sinh ít (<25% sức chứa): Giảm thùng **`25 L → 20 L`** và kéo dài lịch gom **`48h → 72h`** (`Đã tự động áp dụng`).
-     - Hộ được đề xuất giảm thùng nhưng rác đang tồn trong thùng nhiều hơn dung tích mới: Hệ thống báo **`Chặn giảm (rác tồn > mức mới)`**.
+   - Hộ phát sinh nhiều (>80% sức chứa): Tăng thùng **`+5 L`** và rút ngắn lịch gom **`-24h`** (`Đã áp dụng`).
+   - Hộ phát sinh ít (<25% sức chứa): Giảm thùng **`-5 L`** và kéo dài lịch gom **`+24h`** (`Đã áp dụng`).
+   - Hộ được đề xuất giảm thùng nhưng rác đang tồn vượt dung tích mới: Hệ thống báo **`Chặn giảm (rác tồn > mức mới)`**.
 3. Chỉ vào **Bảng 2 (Tự động tăng/giảm số xe thu gom theo khu 1 ↔ 2 xe)**:
-   - Chỉ ngay vào các dòng đầu bảng có cột **`Quân số xe (Trước → Sau)`**:
-     - Các khu lượng rác tăng cao được tự động cấp thêm **`Xe tăng cường #2`** (**`1 → 2 xe`**).
-     - Khu lượng rác giảm (`X-01-O-2`) được tự động rút xe số 2 về trạng thái **`Tạm rút (dự phòng)`** (**`2 → 1 xe`**).
+   - Các khu tải cao được cấp thêm **`Xe tăng cường #2`** (**`1 → 2 xe`**); khi tải giảm tự động rút về **`Dự phòng (standby)`**.
 
 ### ⏱ Phút 4: Bước 4 — Hóa đơn, Đối soát Thanh toán & Khép vòng tròn nợ quá hạn
-1. Bấm vào ô **`Bước 4: Hóa đơn & Kiểm soát nợ`**.
-2. Chỉ vào **4 ô thẻ tổng quan** ở đầu trang (cả 4 trạng thái đều có số liệu thực tế cùng lúc):
-   - **Đã thanh toán đủ (`2.664 hộ`)** · **Chưa đóng còn trong hạn 1 tháng (`396 hộ`)** · **Đóng thiếu tiền chờ đóng bù (`180 hộ`)** · **Quá hạn > 1 tháng ngừng thu gom (`360 hộ`)**.
-3. Chỉ vào **Bảng danh sách hóa đơn** (ngay 20 hộ đầu tiên từ `H-0001` đến `H-0020` của Khu 01 đã có đủ tất cả các trường hợp mẫu để thuyết trình):
-   - **`H-0002`**: Chuyển đúng mã hóa đơn nhưng **thiếu 2.000 đ** $\rightarrow$ Trạng thái **`Đóng thiếu (chờ đóng bù)`** (còn trong hạn 1 tháng nên vẫn tạm thời được gom).
-   - **`H-0003`**: Mới phát hành, chưa đóng nhưng **còn trong hạn 1 tháng** $\rightarrow$ Trạng thái **`Chưa đóng (còn hạn)`**.
-   - **`H-0004`**: Chuyển khoản bấm 2 lần trùng mã giao dịch $\rightarrow$ Hệ thống tự lọc trùng, ghi nhận **`Đã thanh toán đủ`**.
-   - **`H-0005`**: Chuyển **thừa 2.000 đ** $\rightarrow$ Vẫn ghi nhận **`Đã thanh toán đủ`** để không bị ngưng gom rác, đồng thời log bên dưới báo **`Thừa tiền (Đã gom · Liên hệ hoàn tiền)`** qua Hotline `1900 6886` / `doisoat@tuanhung.vn`.
-   - **`H-0019` (đóng thiếu quá 1 tháng)** và **`H-0020` (không đóng quá 1 tháng)**: Đã chuyển sang **`Quá hạn · Ngừng gom`** $\rightarrow$ **Khép kín vòng tròn quay lại Bước 1 bị xe rác bỏ qua!**
-4. Bấm vào nút **`🖨 Xem / In PDF`** ở một hộ bất kỳ để mở trang hóa đơn chi tiết (hiển thị rõ phí cơ bản 15.000đ + số kg từng loại rác × đơn giá + thông tin liên hệ hoàn tiền thừa).
+1. Bấm vào **`Bước 4: Hóa đơn & Thu phí`** (`04 · Hóa đơn & Thu phí`).
+2. Chỉ vào **Biểu đồ Donut cơ cấu thanh toán** và **4 thẻ KPI**:
+   - Hiển thị đầy đủ các trạng thái: **Đã thanh toán đủ**, **Chưa đóng (còn hạn)**, **Đóng thiếu (chờ đóng bù)** và **Quá hạn > 1 tháng (Ngừng gom · 5% = 180 hộ)**.
+3. Chỉ vào **Bảng danh sách hóa đơn** và **Nhật ký đối soát giao dịch**:
+   - Đóng đúng & đủ (`exact_match`) hoặc đóng thừa (`overpaid_refund`) $\rightarrow$ **`Đã thanh toán`** để hộ dân vẫn được thu gom, tiền thừa/chuyển sai liên hệ Phòng Đối Soát qua SĐT **`0392196240`** / `doisoat@tuanhung.vn`.
+   - Không đóng hoặc đóng thiếu sau 1 tháng (`H-0020`, `H-0019`...) $\rightarrow$ **`Quá hạn · Ngừng gom`** $\rightarrow$ **Khép kín vòng tròn quay lại Bước 1 bị xe rác bỏ qua!**
+4. Bấm nút **`🖨 In PDF`** ở một hóa đơn bất kỳ để mở trang hóa đơn chi tiết.
 
 ### ⏱ Phút 5: Nền tảng Big Data — Kafka → Spark → HDFS & PostgreSQL
 1. Bấm vào ô **`Nền tảng Big Data: Kafka → Spark → HDFS`**.
